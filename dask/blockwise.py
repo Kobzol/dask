@@ -41,6 +41,7 @@ def blockwise_token(i, prefix="_"):
     return prefix + "%d" % i
 
 
+# IMPORTANT
 def blockwise(
     func,
     output,

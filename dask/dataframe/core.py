@@ -8,6 +8,8 @@ from pprint import pformat
 
 import numpy as np
 import pandas as pd
+from distributed import get_client
+from distributed.taskarrays import TaskArray, index
 from pandas.util import cache_readonly
 from pandas.api.types import (
     is_bool_dtype,
@@ -272,7 +274,7 @@ class _Frame(DaskMethodsMixin, OperatorMethodMixin):
 
     Parameters
     ----------
-    dsk: dict
+    dsk: TaskArray
         The dask graph to compute this DataFrame
     name: str
         The key prefix that specifies which keys in the dask comprise this
@@ -284,11 +286,12 @@ class _Frame(DaskMethodsMixin, OperatorMethodMixin):
         Values along which we partition our blocks on the index
     """
 
-    def __init__(self, dsk, name, meta, divisions):
-        if not isinstance(dsk, HighLevelGraph):
-            dsk = HighLevelGraph.from_collections(name, dsk, dependencies=[])
-        self.dask = dsk
-        self._name = name
+    def __init__(self, taskarray, name, meta, divisions):
+        assert isinstance(taskarray, TaskArray)
+        # if not isinstance(dsk, HighLevelGraph):
+        #     dsk = HighLevelGraph.from_collections(name, dsk, dependencies=[])
+        self.dask = taskarray
+        self._name = self.dask.id
         meta = make_meta(meta)
         if not self._is_partition_type(meta):
             raise TypeError(
@@ -302,7 +305,7 @@ class _Frame(DaskMethodsMixin, OperatorMethodMixin):
         return self.dask
 
     def __dask_keys__(self):
-        return [(self._name, i) for i in range(self.npartitions)]
+        return [f"{self._name}-{i}" for i in range(self.npartitions)]
 
     def __dask_layers__(self):
         return (self._name,)
@@ -4877,6 +4880,7 @@ def split_out_on_cols(df, cols=None):
     return df[cols]
 
 
+# IMPORTANT
 @insert_meta_param_description
 def apply_concat_apply(
     args,
@@ -5089,7 +5093,219 @@ def apply_concat_apply(
     return new_dd_object(graph, b, meta, divisions)
 
 
+@insert_meta_param_description
+def apply_concat_apply_ta(
+    args,
+    chunk=None,
+    aggregate=None,
+    combine=None,
+    meta=no_default,
+    token=None,
+    chunk_kwargs=None,
+    aggregate_kwargs=None,
+    combine_kwargs=None,
+    split_every=None,
+    split_out=None,
+    split_out_setup=None,
+    split_out_setup_kwargs=None,
+    sort=None,
+    ignore_index=False,
+    **kwargs,
+):
+    """Apply a function to blocks, then concat, then apply again
+
+    Parameters
+    ----------
+    args :
+        Positional arguments for the `chunk` function. All `dask.dataframe`
+        objects should be partitioned and indexed equivalently.
+    chunk : function [block-per-arg] -> block
+        Function to operate on each block of data
+    aggregate : function concatenated-block -> block
+        Function to operate on the concatenated result of chunk
+    combine : function concatenated-block -> block, optional
+        Function to operate on intermediate concatenated results of chunk
+        in a tree-reduction. If not provided, defaults to aggregate.
+    $META
+    token : str, optional
+        The name to use for the output keys.
+    chunk_kwargs : dict, optional
+        Keywords for the chunk function only.
+    aggregate_kwargs : dict, optional
+        Keywords for the aggregate function only.
+    combine_kwargs : dict, optional
+        Keywords for the combine function only.
+    split_every : int, optional
+        Group partitions into groups of this size while performing a
+        tree-reduction. If set to False, no tree-reduction will be used,
+        and all intermediates will be concatenated and passed to ``aggregate``.
+        Default is 8.
+    split_out : int, optional
+        Number of output partitions. Split occurs after first chunk reduction.
+    split_out_setup : callable, optional
+        If provided, this function is called on each chunk before performing
+        the hash-split. It should return a pandas object, where each row
+        (excluding the index) is hashed. If not provided, the chunk is hashed
+        as is.
+    split_out_setup_kwargs : dict, optional
+        Keywords for the `split_out_setup` function only.
+    sort : bool, default None
+        If allowed, sort the keys of the output aggregation.
+    ignore_index : bool, default False
+        If True, do not preserve index values throughout ACA operations.
+    kwargs :
+        All remaining keywords will be passed to ``chunk``, ``aggregate``, and
+        ``combine``.
+
+    Examples
+    --------
+    >>> def chunk(a_block, b_block):
+    ...     pass
+
+    >>> def agg(df):
+    ...     pass
+
+    >>> apply_concat_apply([a, b], chunk=chunk, aggregate=agg)  # doctest: +SKIP
+    """
+    if chunk_kwargs is None:
+        chunk_kwargs = dict()
+    if aggregate_kwargs is None:
+        aggregate_kwargs = dict()
+    chunk_kwargs.update(kwargs)
+    aggregate_kwargs.update(kwargs)
+
+    if combine is None:
+        if combine_kwargs:
+            raise ValueError("`combine_kwargs` provided with no `combine`")
+        combine = aggregate
+        combine_kwargs = aggregate_kwargs
+    else:
+        if combine_kwargs is None:
+            combine_kwargs = dict()
+        combine_kwargs.update(kwargs)
+
+    if not isinstance(args, (tuple, list)):
+        args = [args]
+
+    dfs = [arg for arg in args if isinstance(arg, _Frame)]
+
+    npartitions = set(arg.npartitions for arg in dfs)
+    if len(npartitions) > 1:
+        raise ValueError("All arguments must have same number of partitions")
+    npartitions = npartitions.pop()
+
+    if split_every is None:
+        split_every = 8
+    elif split_every is False:
+        split_every = npartitions
+    elif split_every < 2 or not isinstance(split_every, Integral):
+        raise ValueError("split_every must be an integer >= 2")
+
+    token_key = tokenize(
+        token or (chunk, aggregate),
+        meta,
+        args,
+        chunk_kwargs,
+        aggregate_kwargs,
+        combine_kwargs,
+        split_every,
+        split_out,
+        split_out_setup,
+        split_out_setup_kwargs,
+    )
+
+    # Chunk
+    a = "{0}-chunk-{1}".format(token or funcname(chunk), token_key)
+    if len(args) == 1 and isinstance(args[0], _Frame) and not chunk_kwargs:
+        dsk = {
+            (a, 0, i, 0): (chunk, key) for i, key in enumerate(args[0].__dask_keys__())
+        }
+    else:
+        dsk = {
+            (a, 0, i, 0): (
+                apply,
+                chunk,
+                [(x._name, i) if isinstance(x, _Frame) else x for x in args],
+                chunk_kwargs,
+            )
+            for i in range(npartitions)
+        }
+
+    # Split
+    if split_out and split_out > 1:
+        split_prefix = "split-%s" % token_key
+        shard_prefix = "shard-%s" % token_key
+        for i in range(npartitions):
+            dsk[(split_prefix, i)] = (
+                hash_shard,
+                (a, 0, i, 0),
+                split_out,
+                split_out_setup,
+                split_out_setup_kwargs,
+                ignore_index,
+            )
+            for j in range(split_out):
+                dsk[(shard_prefix, 0, i, j)] = (getitem, (split_prefix, i), j)
+        a = shard_prefix
+    else:
+        split_out = 1
+
+    # Combine
+    b = "{0}-combine-{1}".format(token or funcname(combine), token_key)
+    k = npartitions
+    depth = 0
+    while k > split_every:
+        for part_i, inds in enumerate(partition_all(split_every, range(k))):
+            for j in range(split_out):
+                conc = (_concat, [(a, depth, i, j) for i in inds], ignore_index)
+                if combine_kwargs:
+                    dsk[(b, depth + 1, part_i, j)] = (
+                        apply,
+                        combine,
+                        [conc],
+                        combine_kwargs,
+                    )
+                else:
+                    dsk[(b, depth + 1, part_i, j)] = (combine, conc)
+        k = part_i + 1
+        a = b
+        depth += 1
+
+    if sort is not None:
+        if sort and split_out > 1:
+            raise NotImplementedError(
+                "Cannot guarentee sorted keys for `split_out>1`."
+                " Try using split_out=1, or grouping with sort=False."
+            )
+        aggregate_kwargs = aggregate_kwargs or {}
+        aggregate_kwargs["sort"] = sort
+
+    # Aggregate
+    for j in range(split_out):
+        b = "{0}-agg-{1}".format(token or funcname(aggregate), token_key)
+        conc = (_concat, [(a, depth, i, j) for i in range(k)], ignore_index)
+        if aggregate_kwargs:
+            dsk[(b, j)] = (apply, aggregate, [conc], aggregate_kwargs)
+        else:
+            dsk[(b, j)] = (aggregate, conc)
+
+    if meta is no_default:
+        meta_chunk = _emulate(chunk, *args, udf=True, **chunk_kwargs)
+        meta = _emulate(
+            aggregate, _concat([meta_chunk], ignore_index), udf=True, **aggregate_kwargs
+        )
+    meta = make_meta(
+        meta, index=(getattr(make_meta(dfs[0]), "index", None) if dfs else None)
+    )
+
+    graph = HighLevelGraph.from_collections(b, dsk, dependencies=dfs)
+
+    divisions = [None] * (split_out + 1)
+
+    return new_dd_object(graph, b, meta, divisions)
+
 aca = apply_concat_apply
+# aca = apply_concat_apply_ta
 
 
 def _extract_meta(x, nonempty=False):
@@ -5124,6 +5340,7 @@ def _emulate(func, *args, **kwargs):
         return func(*_extract_meta(args, True), **_extract_meta(kwargs, True))
 
 
+# IMPORTANT
 @insert_meta_param_description
 def map_partitions(
     func,
@@ -6322,6 +6539,7 @@ def new_dd_object(dsk, name, meta, divisions):
         return get_parallel_type(meta)(dsk, name, meta, divisions)
 
 
+# IMPORTANT
 def partitionwise_graph(func, name, *args, **kwargs):
     """
     Apply a function partition-wise across arguments to create layer of a graph

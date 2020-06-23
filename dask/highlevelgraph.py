@@ -107,6 +107,7 @@ class HighLevelGraph(Mapping):
 
         return cls(layers, deps)
 
+    # IMPORTANT
     @classmethod
     def from_collections(cls, name, layer, dependencies=()):
         """ Construct a HighLevelGraph from a new layer and a set of collections

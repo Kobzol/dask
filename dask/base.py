@@ -207,6 +207,7 @@ def collections_to_dsk(collections, optimize_graph=True, **kwargs):
     """
     optimizations = kwargs.pop("optimizations", None) or config.get("optimizations", [])
 
+    optimize_graph = False  # TODO
     if optimize_graph:
         groups = groupby(optimization_function, collections)
 
@@ -241,7 +242,12 @@ def _extract_graph_and_keys(vals):
         graphs.append(v.__dask_graph__())
         keys.append(v.__dask_keys__())
 
-    if any(isinstance(graph, HighLevelGraph) for graph in graphs):
+    from distributed.taskarrays import TaskArray  # TODO
+
+    if any(isinstance(graph, TaskArray) for graph in graphs):
+        assert len(graphs) == 1
+        graph = graphs[0]
+    elif any(isinstance(graph, HighLevelGraph) for graph in graphs):
         graph = HighLevelGraph.merge(*graphs)
     else:
         graph = merge(*map(ensure_dict, graphs))

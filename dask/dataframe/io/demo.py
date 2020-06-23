@@ -1,8 +1,9 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
+from distributed.taskarrays import TaskArray, ctx_ref, index
 
-from ..core import tokenize, DataFrame
 from .io import from_delayed
+from ..core import DataFrame, tokenize
 from ...delayed import delayed
 from ...utils import random_state_data
 
@@ -82,13 +83,13 @@ def make_timeseries_part(start, end, dtypes, freq, state_data, kwargs):
 
 
 def make_timeseries(
-    start="2000-01-01",
-    end="2000-12-31",
-    dtypes={"name": str, "id": int, "x": float, "y": float},
-    freq="10s",
-    partition_freq="1M",
-    seed=None,
-    **kwargs
+        start="2000-01-01",
+        end="2000-12-31",
+        dtypes={"name": str, "id": int, "x": float, "y": float},
+        freq="10s",
+        partition_freq="1M",
+        seed=None,
+        **kwargs
 ):
     """ Create timeseries dataframe with random data
 
@@ -130,31 +131,30 @@ def make_timeseries(
     name = "make-timeseries-" + tokenize(
         start, end, dtypes, freq, partition_freq, state_data
     )
-    dsk = {
-        (name, i): (
-            make_timeseries_part,
-            divisions[i],
-            divisions[i + 1],
-            dtypes,
-            freq,
-            state_data[i],
-            kwargs,
-        )
-        for i in range(len(divisions) - 1)
-    }
+    context = divisions + state_data
+
+    result_ta = TaskArray(len(divisions) - 1, make_timeseries_part, [
+        ctx_ref(index),
+        ctx_ref(index + 1),
+        dtypes,
+        freq,
+        ctx_ref(index + len(divisions)),
+        kwargs
+    ], context=context)
+
     head = make_timeseries_part("2000", "2000", dtypes, "1H", state_data[0], kwargs)
-    return DataFrame(dsk, name, head, divisions)
+    return DataFrame(result_ta, name, head, divisions)
 
 
 def generate_day(
-    date,
-    open,
-    high,
-    low,
-    close,
-    volume,
-    freq=pd.Timedelta(seconds=60),
-    random_state=None,
+        date,
+        open,
+        high,
+        low,
+        close,
+        volume,
+        freq=pd.Timedelta(seconds=60),
+        random_state=None,
 ):
     """ Generate a day of financial data from open/close high/low values """
     if not isinstance(random_state, np.random.RandomState):
@@ -199,12 +199,12 @@ def generate_day(
 
 
 def daily_stock(
-    symbol,
-    start,
-    stop,
-    freq=pd.Timedelta(seconds=1),
-    data_source="yahoo",
-    random_state=None,
+        symbol,
+        start,
+        stop,
+        freq=pd.Timedelta(seconds=1),
+        data_source="yahoo",
+        random_state=None,
 ):
     """ Create artificial stock data
 

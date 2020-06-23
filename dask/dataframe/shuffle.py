@@ -2,39 +2,39 @@ import contextlib
 import logging
 import math
 import shutil
-from operator import getitem
-import uuid
 import tempfile
+import uuid
+from operator import getitem
 
-import tlz as toolz
 import numpy as np
 import pandas as pd
+import tlz as toolz
+from distributed.taskarrays import TaskArray, index
 
+from . import methods
 from .core import DataFrame, Series, _Frame, _concat, map_partitions, new_dd_object
-
+from .utils import group_split_dispatch, hash_object_dispatch
 from .. import base, config
-from ..base import tokenize, compute, compute_as_if_collection, is_dask_collection
+from ..base import compute, compute_as_if_collection, is_dask_collection, tokenize
 from ..delayed import delayed
 from ..highlevelgraph import HighLevelGraph
 from ..sizeof import sizeof
-from ..utils import digit, insert, M
-from .utils import hash_object_dispatch, group_split_dispatch
-from . import methods
+from ..utils import M, digit, insert
 
 logger = logging.getLogger(__name__)
 
 
 def set_index(
-    df,
-    index,
-    npartitions=None,
-    shuffle=None,
-    compute=False,
-    drop=True,
-    upsample=1.0,
-    divisions=None,
-    partition_size=128e6,
-    **kwargs
+        df,
+        index,
+        npartitions=None,
+        shuffle=None,
+        compute=False,
+        drop=True,
+        upsample=1.0,
+        divisions=None,
+        partition_size=128e6,
+        **kwargs
 ):
     """ See _Frame.set_index for docstring """
     if isinstance(index, Series) and index._name == df.index._name:
@@ -42,9 +42,9 @@ def set_index(
     if isinstance(index, (DataFrame, tuple, list)):
         # Accept ["a"], but not [["a"]]
         if (
-            isinstance(index, list)
-            and len(index) == 1
-            and not isinstance(index[0], list)  # if index = [["a"]], leave it that way
+                isinstance(index, list)
+                and len(index) == 1
+                and not isinstance(index[0], list)  # if index = [["a"]], leave it that way
         ):
             index = index[0]
         else:
@@ -110,9 +110,9 @@ def set_index(
             maxes = pd.Categorical(maxes, dtype=dtype).codes.tolist()
 
         if (
-            mins == sorted(mins)
-            and maxes == sorted(maxes)
-            and all(mx < mn for mx, mn in zip(maxes[:-1], mins[1:]))
+                mins == sorted(mins)
+                and maxes == sorted(maxes)
+                and all(mx < mn for mx, mn in zip(maxes[:-1], mins[1:]))
         ):
             divisions = mins + [maxes[-1]]
             result = set_sorted_index(df, index, drop=drop, divisions=divisions)
@@ -153,7 +153,7 @@ def remove_nans(divisions):
 
 
 def set_partition(
-    df, index, divisions, max_branch=32, drop=True, shuffle=None, compute=None
+        df, index, divisions, max_branch=32, drop=True, shuffle=None, compute=None
 ):
     """ Group DataFrame by index
 
@@ -244,13 +244,13 @@ def set_partition(
 
 
 def shuffle(
-    df,
-    index,
-    shuffle=None,
-    npartitions=None,
-    max_branch=32,
-    ignore_index=False,
-    compute=None,
+        df,
+        index,
+        shuffle=None,
+        npartitions=None,
+        max_branch=32,
+        ignore_index=False,
+        compute=None,
 ):
     """ Group DataFrame by index
 
@@ -336,13 +336,13 @@ def rearrange_by_divisions(df, column, divisions, max_branch=None, shuffle=None)
 
 
 def rearrange_by_column(
-    df,
-    col,
-    npartitions=None,
-    max_branch=None,
-    shuffle=None,
-    compute=None,
-    ignore_index=False,
+        df,
+        col,
+        npartitions=None,
+        max_branch=None,
+        shuffle=None,
+        compute=None,
+        ignore_index=False,
 ):
     shuffle = shuffle or config.get("shuffle", None) or "disk"
     if shuffle == "disk":
@@ -471,7 +471,6 @@ def _noop(x, cleanup_token):
 def _simple_rearrange_by_column_tasks(df, column, npartitions, ignore_index=False):
     """ A simplified (single-stage) version of ``rearrange_by_column_tasks``.
     """
-
     token = tokenize(df, column)
     simple_shuffle_group_token = "simple-shuffle-group-" + token
     simple_shuffle_split_token = "simple-shuffle-split-" + token
@@ -485,19 +484,6 @@ def _simple_rearrange_by_column_tasks(df, column, npartitions, ignore_index=Fals
     group = {}
     split = {}
     combine = {}
-
-    for i in iter_tuples[: df.npartitions]:
-        # Convert partition into dict of dataframe pieces
-        group[(simple_shuffle_group_token, i)] = (
-            shuffle_group,
-            (df._name, i),
-            column,
-            0,
-            npartitions,
-            npartitions,
-            ignore_index,
-            npartitions,
-        )
 
     for j in iter_tuples[:npartitions]:
         _concat_list = []
@@ -528,8 +514,28 @@ def _simple_rearrange_by_column_tasks(df, column, npartitions, ignore_index=Fals
     )
 
 
+def _rearrange_by_column_ta(df, column, npartitions, ignore_index=False):
+    assert df.npartitions == npartitions
+    parts = TaskArray(df.npartitions, shuffle_group, [
+        df.dask[index],
+        column,
+        0,
+        npartitions,
+        npartitions,
+        ignore_index,
+        npartitions
+    ])
+    items = TaskArray(npartitions * df.npartitions, getitem,
+                      [parts[index // df.npartitions], index % df.npartitions])
+    combined = TaskArray(df.npartitions, _concat, [items[index::df.npartitions], ignore_index])
+
+    return new_dd_object(
+        combined, "TODO", df, (None,) * (npartitions + 1)
+    )
+
+
 def rearrange_by_column_tasks(
-    df, column, max_branch=32, npartitions=None, ignore_index=False
+        df, column, max_branch=32, npartitions=None, ignore_index=False
 ):
     """ Order divisions of DataFrame so that all values within column(s) align
 
@@ -594,6 +600,8 @@ def rearrange_by_column_tasks(
         k = int(math.ceil(n ** (1 / stages)))
     else:
         k = n
+
+    return _rearrange_by_column_ta(df, column, (npartitions or n), ignore_index=ignore_index)
 
     if (npartitions or n) <= max_branch:
         # We are creating a small number of output partitions.
@@ -796,7 +804,7 @@ def shuffle_group_2(df, cols, ignore_index, nparts):
         ind = df[cols[0]].astype(np.int32)
     else:
         ind = (
-            hash_object_dispatch(df[cols] if cols else df, index=False) % int(nparts)
+                hash_object_dispatch(df[cols] if cols else df, index=False) % int(nparts)
         ).astype(np.int32)
 
     n = ind.max() + 1
@@ -930,9 +938,9 @@ def compute_and_set_divisions(df, **kwargs):
     mins, maxes = compute(mins, maxes, **kwargs)
 
     if (
-        sorted(mins) != list(mins)
-        or sorted(maxes) != list(maxes)
-        or any(a > b for a, b in zip(mins, maxes))
+            sorted(mins) != list(mins)
+            or sorted(maxes) != list(maxes)
+            or any(a > b for a, b in zip(mins, maxes))
     ):
         raise ValueError(
             "Partitions must be sorted ascending with the index", mins, maxes
