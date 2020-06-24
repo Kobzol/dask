@@ -110,13 +110,14 @@ def finalize(results):
 class Scalar(DaskMethodsMixin, OperatorMethodMixin):
     """ A Dask object to represent a pandas scalar"""
 
-    def __init__(self, dsk, name, meta, divisions=None):
+    def __init__(self, taskarray, name, meta, divisions=None):
         # divisions is ignored, only present to be compatible with other
         # objects.
-        if not isinstance(dsk, HighLevelGraph):
-            dsk = HighLevelGraph.from_collections(name, dsk, dependencies=[])
-        self.dask = dsk
-        self._name = name
+        assert isinstance(taskarray, TaskArray)
+        # if not isinstance(dsk, HighLevelGraph):
+        #     dsk = HighLevelGraph.from_collections(name, dsk, dependencies=[])
+        self.dask = taskarray
+        self._name = self.dask.id
         meta = make_meta(meta)
         if is_dataframe_like(meta) or is_series_like(meta) or is_index_like(meta):
             raise TypeError(
@@ -129,7 +130,7 @@ class Scalar(DaskMethodsMixin, OperatorMethodMixin):
         return self.dask
 
     def __dask_keys__(self):
-        return [self.key]
+        return [f"{self.key[0]}-0"]
 
     def __dask_tokenize__(self):
         return self._name
@@ -5217,11 +5218,16 @@ def apply_concat_apply_ta(
     # Chunk
     a = "{0}-chunk-{1}".format(token or funcname(chunk), token_key)
     if len(args) == 1 and isinstance(args[0], _Frame) and not chunk_kwargs:
-        dsk = {
+        dsk = TaskArray(npartitions, chunk, [args[0].dask[index]])
+        """dsk = {
             (a, 0, i, 0): (chunk, key) for i, key in enumerate(args[0].__dask_keys__())
-        }
+        }"""
     else:
-        dsk = {
+        dsk = TaskArray(npartitions, apply,
+                        [chunk,
+                         [arg.dask[index] if isinstance(arg, _Frame) else arg for arg in args],
+                         chunk_kwargs])
+        """dsk = {
             (a, 0, i, 0): (
                 apply,
                 chunk,
@@ -5229,10 +5235,11 @@ def apply_concat_apply_ta(
                 chunk_kwargs,
             )
             for i in range(npartitions)
-        }
+        }"""
 
     # Split
     if split_out and split_out > 1:
+        raise NotImplementedError()
         split_prefix = "split-%s" % token_key
         shard_prefix = "shard-%s" % token_key
         for i in range(npartitions):
@@ -5255,6 +5262,7 @@ def apply_concat_apply_ta(
     k = npartitions
     depth = 0
     while k > split_every:
+        raise NotImplementedError()
         for part_i, inds in enumerate(partition_all(split_every, range(k))):
             for j in range(split_out):
                 conc = (_concat, [(a, depth, i, j) for i in inds], ignore_index)
@@ -5281,13 +5289,22 @@ def apply_concat_apply_ta(
         aggregate_kwargs["sort"] = sort
 
     # Aggregate
-    for j in range(split_out):
+    if aggregate_kwargs:
+        dsk = TaskArray(split_out, apply, [aggregate, [dsk], aggregate_kwargs])
+    else:
+        dsk = TaskArray(split_out, aggregate, [[dsk]])
+
+    # client = get_client()
+    # fs = client._taskarray_to_futures(dsk)
+    # res = client.gather(fs)
+
+    """for j in range(split_out):
         b = "{0}-agg-{1}".format(token or funcname(aggregate), token_key)
         conc = (_concat, [(a, depth, i, j) for i in range(k)], ignore_index)
         if aggregate_kwargs:
             dsk[(b, j)] = (apply, aggregate, [conc], aggregate_kwargs)
         else:
-            dsk[(b, j)] = (aggregate, conc)
+            dsk[(b, j)] = (aggregate, conc)"""
 
     if meta is no_default:
         meta_chunk = _emulate(chunk, *args, udf=True, **chunk_kwargs)
@@ -5298,14 +5315,14 @@ def apply_concat_apply_ta(
         meta, index=(getattr(make_meta(dfs[0]), "index", None) if dfs else None)
     )
 
-    graph = HighLevelGraph.from_collections(b, dsk, dependencies=dfs)
+    # graph = HighLevelGraph.from_collections(b, dsk, dependencies=dfs)
 
     divisions = [None] * (split_out + 1)
 
-    return new_dd_object(graph, b, meta, divisions)
+    return new_dd_object(dsk, "TODO", meta, divisions)
 
-aca = apply_concat_apply
-# aca = apply_concat_apply_ta
+# aca = apply_concat_apply
+aca = apply_concat_apply_ta
 
 
 def _extract_meta(x, nonempty=False):
@@ -5393,6 +5410,7 @@ def map_partitions(
         meta = make_meta(meta, index=meta_index)
 
     if all(isinstance(arg, Scalar) for arg in args):
+        raise NotImplementedError()
         layer = {
             (name, 0): (apply, func, (tuple, [(arg._name, 0) for arg in args]), kwargs)
         }
@@ -5431,21 +5449,19 @@ def map_partitions(
         if collections:
             simple = False
 
+    frame = args[0]
+    assert isinstance(frame, _Frame)
     if enforce_metadata:
-        dsk = partitionwise_graph(
-            apply_and_enforce,
-            name,
-            *args2,
-            dependencies=dependencies,
-            _func=func,
-            _meta=meta,
-            **kwargs3,
-        )
+        kwargs = dict(kwargs3)
+        kwargs["_func"] = func
+        kwargs["_meta"] = meta
+        dsk = TaskArray(frame.npartitions, apply, [apply_and_enforce, [frame.dask[index]] + args2[1:], kwargs])
     else:
         kwargs4 = kwargs if simple else kwargs3
-        dsk = partitionwise_graph(
-            func, name, *args2, **kwargs4, dependencies=dependencies
-        )
+        kwargs = dict(kwargs4)
+        kwargs["_func"] = func
+        kwargs["_meta"] = meta
+        dsk = TaskArray(frame.npartitions, func, [*args2], kwargs)
 
     divisions = dfs[0].divisions
     if transform_divisions and isinstance(dfs[0], Index) and len(dfs) == 1:
@@ -5461,8 +5477,7 @@ def map_partitions(
             if not valid_divisions(divisions):
                 divisions = [None] * (dfs[0].npartitions + 1)
 
-    graph = HighLevelGraph.from_collections(name, dsk, dependencies=dependencies)
-    return new_dd_object(graph, name, meta, divisions)
+    return new_dd_object(dsk, "TODO", meta, divisions)
 
 
 def apply_and_enforce(*args, **kwargs):
